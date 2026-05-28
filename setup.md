@@ -41,7 +41,7 @@ Check your Raspberry Pi OS version:
 grep VERSION_CODENAME /etc/os-release
 ```
 
-### If output is `bookworm` (newer Raspberry Pi OS)
+### If output is `trixie` or `bookworm` (newer Raspberry Pi OS)
 
 Install and run:
 
