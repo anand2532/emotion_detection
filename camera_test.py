@@ -19,6 +19,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 
@@ -104,26 +105,58 @@ def get_haarcascade_dir() -> str:
         if cascade_dir and os.path.isdir(cascade_dir):
             return cascade_dir
 
+    # Optional override for custom/manual cascade directory.
+    custom_dir = os.environ.get("HAAR_CASCADE_DIR", "")
+    if custom_dir and os.path.isdir(custom_dir):
+        return custom_dir if custom_dir.endswith("/") else custom_dir + "/"
+
     # Common distro fallback paths (Raspberry Pi OS / Debian variants).
     fallback_dirs = [
         "/usr/share/opencv4/haarcascades/",
         "/usr/share/opencv/haarcascades/",
+        "/usr/local/share/opencv4/haarcascades/",
+        "/usr/local/share/opencv/haarcascades/",
     ]
     for candidate in fallback_dirs:
         if os.path.isdir(candidate):
             return candidate
 
+    # Python site-package fallback: .../cv2/data/haarcascade_*.xml
+    cv2_file = getattr(cv2, "__file__", "")
+    if cv2_file:
+        candidate = Path(cv2_file).resolve().parent / "data"
+        if candidate.is_dir():
+            return str(candidate) + "/"
+
     raise RuntimeError(
-        "Could not find Haar cascades directory. Install with: sudo apt install -y python3-opencv"
+        "Could not find Haar cascades directory.\n"
+        "Try:\n"
+        "  sudo apt install -y python3-opencv opencv-data\n"
+        "or set custom path:\n"
+        "  export HAAR_CASCADE_DIR=/path/to/haarcascades"
     )
 
 
 def load_detectors() -> DetectorBundle:
     """Load Haar cascades for lightweight face-feature analysis."""
     cascade_dir = get_haarcascade_dir()
-    face = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
-    eyes = cv2.CascadeClassifier(cascade_dir + "haarcascade_eye.xml")
-    smile = cv2.CascadeClassifier(cascade_dir + "haarcascade_smile.xml")
+    face_xml = cascade_dir + "haarcascade_frontalface_default.xml"
+    eyes_xml = cascade_dir + "haarcascade_eye.xml"
+    smile_xml = cascade_dir + "haarcascade_smile.xml"
+
+    if not (os.path.exists(face_xml) and os.path.exists(eyes_xml) and os.path.exists(smile_xml)):
+        troubleshooting_hint("missing_deps")
+        raise RuntimeError(
+            "Haar cascade XML files not found.\n"
+            f"Checked directory: {cascade_dir}\n"
+            "Install data files:\n"
+            "  sudo apt install -y opencv-data\n"
+            "Then retry."
+        )
+
+    face = cv2.CascadeClassifier(face_xml)
+    eyes = cv2.CascadeClassifier(eyes_xml)
+    smile = cv2.CascadeClassifier(smile_xml)
     if face.empty() or eyes.empty() or smile.empty():
         troubleshooting_hint("missing_deps")
         raise RuntimeError("Failed to load OpenCV Haar cascade files.")
