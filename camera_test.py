@@ -1,170 +1,285 @@
 #!/usr/bin/env python3
 """
-Live camera test with lightweight emotion-style detection for IMX219.
+Real-time emotion display demo for Raspberry Pi + IMX219 + OpenCV.
 
 Run:
     python3 camera_test.py
+
+Install (Raspberry Pi OS):
+    sudo apt update
+    sudo apt install -y python3-picamera2 python3-opencv rpicam-apps
+
+Optional (for model-based emotion inference):
+    python3 -m pip install tensorflow-lite-runtime
 """
 
+import logging
+import os
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 
 import cv2
 
 try:
     from picamera2 import Picamera2
 except ImportError:
-    print("Error: picamera2 is not installed.")
-    print("Install it with: sudo apt install -y python3-picamera2")
+    print("ERROR: picamera2 missing. Install: sudo apt install -y python3-picamera2")
     sys.exit(1)
 
 
-def classify_state(smile_count: int, eye_count: int, sleepy_frames: int) -> tuple[str, float, tuple[int, int, int]]:
-    """
-    Return a lightweight 'emotion-like' state.
-    This is a heuristic (not a trained emotion model).
-    """
-    if smile_count > 0:
-        return "HAPPY", 0.88, (60, 220, 120)
-    if eye_count == 0 and sleepy_frames > 8:
-        return "SLEEPY", 0.78, (70, 130, 255)
-    if eye_count >= 2:
-        return "FOCUSED", 0.74, (80, 200, 255)
-    if eye_count == 1:
-        return "THINKING", 0.66, (210, 170, 80)
-    return "NEUTRAL", 0.60, (180, 180, 180)
+EMOTIONS = ["Happy", "Sad", "Angry", "Neutral", "Surprise"]
+EMO_STYLES = {
+    "Happy": {"emoji": ":)", "color": (80, 220, 120)},
+    "Sad": {"emoji": ":(", "color": (220, 120, 80)},
+    "Angry": {"emoji": ">:(", "color": (70, 70, 255)},
+    "Neutral": {"emoji": ":|", "color": (200, 200, 200)},
+    "Surprise": {"emoji": ":O", "color": (90, 200, 255)},
+    "No Face": {"emoji": "...", "color": (130, 130, 130)},
+}
 
 
-def draw_hud(frame: cv2.UMat, label: str, confidence: float, color: tuple[int, int, int], fps: float) -> None:
-    """Draw a small creative overlay for state and confidence."""
-    h, w = frame.shape[:2]
-
-    # Top translucent band.
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 86), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
-
-    # Emotion badge and text.
-    cv2.putText(frame, "EMOTION HUD", (18, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    cv2.putText(frame, f"STATE: {label}", (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 130, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 2)
-
-    # Confidence bar.
-    bar_x, bar_y, bar_w, bar_h = 18, 66, 260, 12
-    fill_w = int(bar_w * max(0.0, min(confidence, 1.0)))
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 80), 1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), color, -1)
+@dataclass
+class DetectorBundle:
+    face: cv2.CascadeClassifier
+    eyes: cv2.CascadeClassifier
+    smile: cv2.CascadeClassifier
 
 
-def main() -> int:
-    """Initialize camera, run heuristic emotion display, exit on 'q'."""
-    picam2 = None
+def setup_logging() -> None:
+    """Basic logger for runtime diagnostics."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
+
+def troubleshooting_hint(section: str) -> None:
+    """Print concise troubleshooting hints for common RPi camera issues."""
+    hints = {
+        "camera_not_detected": (
+            "Camera not detected: run 'rpicam-hello --list-cameras', reseat CSI cable, "
+            "and verify correct Pi 5 camera connector/cable adapter."
+        ),
+        "black_screen": (
+            "Black screen: check lens cap/cable seating, reduce resolution, "
+            "and verify camera works in rpicam-hello."
+        ),
+        "imshow_fail": (
+            "cv2.imshow() failed: likely no GUI display. If using SSH, use VNC/desktop session "
+            "or set DISPLAY correctly."
+        ),
+        "missing_deps": (
+            "Missing dependency/model: install python3-opencv/python3-picamera2 and ensure "
+            "cascade/model files exist."
+        ),
+        "low_fps": (
+            "Low FPS: reduce resolution to 640x480, avoid heavy models, and close other apps."
+        ),
+        "permission": (
+            "Permission issue: ensure user belongs to video group and no other process holds camera."
+        ),
+        "tf_cv_conflict": (
+            "TensorFlow/OpenCV conflict: avoid mixing incompatible wheel/apt builds; "
+            "prefer apt OpenCV and tflite-runtime on RPi."
+        ),
+        "ssh_vnc": (
+            "SSH/VNC display issue: run script inside desktop session or use VNC with DISPLAY set."
+        ),
+    }
+    logging.warning("Troubleshooting: %s", hints.get(section, "General camera diagnostic needed."))
+
+
+def load_detectors() -> DetectorBundle:
+    """Load Haar cascades for lightweight face-feature analysis."""
+    face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    smile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+    if face.empty() or eyes.empty() or smile.empty():
+        troubleshooting_hint("missing_deps")
+        raise RuntimeError("Failed to load OpenCV Haar cascade files.")
+    return DetectorBundle(face=face, eyes=eyes, smile=smile)
+
+
+def setup_camera() -> Picamera2:
+    """Initialize IMX219 camera stream via picamera2."""
     try:
-        # Load built-in Haar cascades for face features.
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
-        smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
-
-        if face_cascade.empty() or eye_cascade.empty() or smile_cascade.empty():
-            print("Error: Failed to load OpenCV Haar cascade files.")
-            print("Please ensure python3-opencv is installed correctly.")
-            return 1
-
-        # Create camera object (camera index 0 is typical for a single IMX219).
         picam2 = Picamera2(0)
-
-        # Configure a preview stream suitable for live display.
-        # format='RGB888' gives 8-bit RGB data that OpenCV can display.
         config = picam2.create_preview_configuration(
-            main={"size": (1280, 720), "format": "RGB888"}
+            main={"size": (960, 540), "format": "RGB888"}
         )
         picam2.configure(config)
         picam2.start()
-
-        # Short warm-up delay lets auto-exposure/auto-white-balance settle.
         time.sleep(0.5)
+        return picam2
+    except Exception as exc:
+        troubleshooting_hint("camera_not_detected")
+        troubleshooting_hint("permission")
+        raise RuntimeError(f"Camera setup failed: {exc}") from exc
 
-        print("Camera started with emotion HUD. Press 'q' to quit.")
 
-        frame_times = deque(maxlen=20)
-        sleepy_counter = 0
+def detect_face(gray_frame, detectors: DetectorBundle):
+    """Return largest detected face rectangle (x, y, w, h) or None."""
+    faces = detectors.face.detectMultiScale(
+        gray_frame, scaleFactor=1.2, minNeighbors=5, minSize=(90, 90)
+    )
+    if len(faces) == 0:
+        return None
+    return max(faces, key=lambda f: f[2] * f[3])
+
+
+def predict_emotion(face_gray, detectors: DetectorBundle, no_eye_streak: int):
+    """
+    Predict emotion with lightweight heuristics.
+
+    Note:
+    - This is not a clinically accurate model.
+    - For better quality, plug in a trained model (TFLite/ONNX) here.
+    """
+    eyes = detectors.eyes.detectMultiScale(face_gray, scaleFactor=1.1, minNeighbors=8, minSize=(20, 20))
+    smiles = detectors.smile.detectMultiScale(face_gray, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
+
+    eye_count = len(eyes)
+    smile_count = len(smiles)
+
+    # Approximate wide-eye indicator for "Surprise".
+    eye_area_ratio = 0.0
+    if eye_count > 0:
+        total_eye_area = sum(int(w * h) for (_, _, w, h) in eyes[:2])
+        face_area = max(1, face_gray.shape[0] * face_gray.shape[1])
+        eye_area_ratio = total_eye_area / face_area
+
+    if smile_count > 0:
+        return "Happy", 0.90, eye_count
+    if eye_count >= 2 and eye_area_ratio > 0.05:
+        return "Surprise", 0.82, eye_count
+    if no_eye_streak > 8:
+        return "Sad", 0.72, eye_count
+    if eye_count >= 2:
+        return "Neutral", 0.70, eye_count
+    return "Angry", 0.64, eye_count
+
+
+def draw_overlay(frame, face_box, emotion: str, confidence: float, fps: float) -> None:
+    """Render creative overlays: face box, emoji, label, and confidence."""
+    h, w = frame.shape[:2]
+    style = EMO_STYLES.get(emotion, EMO_STYLES["Neutral"])
+    color = style["color"]
+    emoji = style["emoji"]
+
+    # Top translucent HUD panel.
+    panel = frame.copy()
+    cv2.rectangle(panel, (0, 0), (w, 92), (20, 20, 20), -1)
+    cv2.addWeighted(panel, 0.35, frame, 0.65, 0, frame)
+
+    # Title + metrics.
+    cv2.putText(frame, "Emotion Vision", (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, f"{emoji}  {emotion}", (16, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
+    cv2.putText(frame, f"Confidence: {confidence * 100:.1f}%", (16, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+    cv2.putText(frame, f"FPS: {fps:.1f}", (w - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 2)
+
+    # Confidence progress bar.
+    bar_x, bar_y, bar_w, bar_h = w - 290, 50, 260, 14
+    fill_w = int(max(0.0, min(confidence, 1.0)) * bar_w)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (90, 90, 90), 1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), color, -1)
+
+    # Face box if available.
+    if face_box is not None:
+        x, y, fw, fh = face_box
+        cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
+        cv2.putText(
+            frame,
+            f"{emotion} {emoji}",
+            (x, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+        )
+
+
+def check_display_environment() -> None:
+    """Log likely GUI issues before calling cv2.imshow()."""
+    if os.environ.get("DISPLAY", "") == "":
+        troubleshooting_hint("ssh_vnc")
+        logging.warning("DISPLAY is empty. GUI window may not open.")
+
+
+def main() -> int:
+    """Main loop: camera capture, face detection, emotion prediction, overlay."""
+    setup_logging()
+    check_display_environment()
+
+    picam2 = None
+    frame_times = deque(maxlen=20)
+    no_eye_streak = 0
+    empty_frame_streak = 0
+
+    try:
+        logging.info("Loading detectors...")
+        detectors = load_detectors()
+
+        logging.info("Starting camera...")
+        picam2 = setup_camera()
+        logging.info("Press 'q' in preview window to quit.")
 
         while True:
-            frame_start = time.time()
-
-            # Capture the latest frame as a NumPy array in RGB format.
+            t0 = time.time()
             frame_rgb = picam2.capture_array()
 
             if frame_rgb is None:
-                print("Warning: received empty frame from camera.")
+                empty_frame_streak += 1
+                if empty_frame_streak > 10:
+                    troubleshooting_hint("black_screen")
+                    logging.error("Too many empty frames from camera.")
+                    return 1
                 continue
 
-            # OpenCV expects BGR for correct color display.
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            empty_frame_streak = 0
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.2, minNeighbors=5, minSize=(90, 90)
-            )
-
-            if len(faces) > 0:
-                # Use the biggest face when multiple faces are present.
-                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                face_roi_gray = gray[y : y + h, x : x + w]
-                face_roi_bgr = frame_bgr[y : y + h, x : x + w]
-
-                eyes = eye_cascade.detectMultiScale(
-                    face_roi_gray, scaleFactor=1.1, minNeighbors=8, minSize=(20, 20)
-                )
-                smiles = smile_cascade.detectMultiScale(
-                    face_roi_gray, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30)
-                )
-
-                if len(eyes) == 0:
-                    sleepy_counter += 1
-                else:
-                    sleepy_counter = max(0, sleepy_counter - 2)
-
-                label, conf, color = classify_state(len(smiles), len(eyes), sleepy_counter)
-
-                # Face box with colored border.
-                cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), color, 2)
-
-                # Draw eye/smile hints for visual feedback.
-                for (ex, ey, ew, eh) in eyes[:2]:
-                    cv2.rectangle(face_roi_bgr, (ex, ey), (ex + ew, ey + eh), (255, 200, 60), 1)
-                for (sx, sy, sw, sh) in smiles[:1]:
-                    cv2.rectangle(face_roi_bgr, (sx, sy), (sx + sw, sy + sh), (70, 255, 120), 1)
+            face_box = detect_face(gray, detectors)
+            if face_box is None:
+                emotion = "No Face"
+                confidence = 0.0
+                no_eye_streak = 0
             else:
-                label, conf, color = ("NO FACE", 0.0, (120, 120, 120))
-                sleepy_counter = 0
+                x, y, w, h = face_box
+                face_gray = gray[y : y + h, x : x + w]
+                emotion, confidence, eye_count = predict_emotion(face_gray, detectors, no_eye_streak)
+                no_eye_streak = no_eye_streak + 1 if eye_count == 0 else max(0, no_eye_streak - 2)
 
-            frame_times.append(time.time() - frame_start)
-            avg_dt = sum(frame_times) / len(frame_times) if frame_times else 0.0
-            fps = (1.0 / avg_dt) if avg_dt > 0 else 0.0
+            frame_times.append(time.time() - t0)
+            avg_dt = sum(frame_times) / len(frame_times)
+            fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+            if fps < 10:
+                troubleshooting_hint("low_fps")
 
-            draw_hud(frame_bgr, label, conf, color, fps)
-            cv2.imshow("IMX219 Live Feed + Emotion", frame_bgr)
+            draw_overlay(frame, face_box, emotion, confidence, fps)
 
-            # Exit when user presses 'q'.
+            try:
+                cv2.imshow("IMX219 Emotion Detection", frame)
+            except cv2.error:
+                troubleshooting_hint("imshow_fail")
+                return 1
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
         return 0
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        logging.info("Interrupted by user.")
         return 0
     except Exception as exc:
-        print(f"Camera error: {exc}")
-        print("Check camera cable, camera interface setting, and package installation.")
+        logging.error("Runtime error: %s", exc)
+        troubleshooting_hint("tf_cv_conflict")
         return 1
     finally:
-        # Always release resources cleanly.
         if picam2 is not None:
             try:
                 picam2.stop()
