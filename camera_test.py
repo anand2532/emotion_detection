@@ -92,11 +92,38 @@ def troubleshooting_hint(section: str) -> None:
     logging.warning("Troubleshooting: %s", hints.get(section, "General camera diagnostic needed."))
 
 
+def get_haarcascade_dir() -> str:
+    """
+    Resolve Haar cascade directory across OpenCV builds.
+    Some distro builds do not expose cv2.data.
+    """
+    # Preferred path when available.
+    cv2_data = getattr(cv2, "data", None)
+    if cv2_data is not None:
+        cascade_dir = getattr(cv2_data, "haarcascades", "")
+        if cascade_dir and os.path.isdir(cascade_dir):
+            return cascade_dir
+
+    # Common distro fallback paths (Raspberry Pi OS / Debian variants).
+    fallback_dirs = [
+        "/usr/share/opencv4/haarcascades/",
+        "/usr/share/opencv/haarcascades/",
+    ]
+    for candidate in fallback_dirs:
+        if os.path.isdir(candidate):
+            return candidate
+
+    raise RuntimeError(
+        "Could not find Haar cascades directory. Install with: sudo apt install -y python3-opencv"
+    )
+
+
 def load_detectors() -> DetectorBundle:
     """Load Haar cascades for lightweight face-feature analysis."""
-    face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    eyes = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
-    smile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
+    cascade_dir = get_haarcascade_dir()
+    face = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
+    eyes = cv2.CascadeClassifier(cascade_dir + "haarcascade_eye.xml")
+    smile = cv2.CascadeClassifier(cascade_dir + "haarcascade_smile.xml")
     if face.empty() or eyes.empty() or smile.empty():
         troubleshooting_hint("missing_deps")
         raise RuntimeError("Failed to load OpenCV Haar cascade files.")
