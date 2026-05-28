@@ -9,6 +9,14 @@ set -u
 
 echo "=== Raspberry Pi Camera Connection Check ==="
 
+print_dmesg_diagnostics() {
+  echo
+  echo "=== dmesg camera diagnostics (latest matches) ==="
+  echo "(If this is empty, try running with sudo for full kernel logs.)"
+  dmesg | grep -Ei "imx219|camera|csi|rp1|unicam|libcamera" | tail -n 40 || true
+  echo "=== end diagnostics ==="
+}
+
 # Pick camera utility based on what is installed.
 CAM_CMD=""
 if command -v rpicam-hello >/dev/null 2>&1; then
@@ -39,8 +47,9 @@ if [[ $LIST_CODE -ne 0 ]]; then
   echo "ERROR: Camera command failed."
   echo "Try:"
   echo "  - Re-seat the CSI ribbon cable (power off first)"
-  echo "  - Enable camera in raspi-config and reboot"
+  echo "  - Check cable orientation and correct CSI connector/adapter"
   echo "  - Update system packages"
+  print_dmesg_diagnostics
   exit 1
 fi
 
@@ -48,6 +57,7 @@ fi
 if echo "$LIST_OUTPUT" | grep -qi "No cameras available"; then
   echo "FAIL: No camera detected."
   echo "Check cable orientation/port and reboot."
+  print_dmesg_diagnostics
   exit 2
 fi
 
